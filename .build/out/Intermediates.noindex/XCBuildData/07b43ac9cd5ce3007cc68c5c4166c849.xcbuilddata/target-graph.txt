@@ -1,0 +1,2 @@
+Target dependency graph (1 target)
+Target 'FansCtrl-product' in project 'FansCtrl' (no dependencies)

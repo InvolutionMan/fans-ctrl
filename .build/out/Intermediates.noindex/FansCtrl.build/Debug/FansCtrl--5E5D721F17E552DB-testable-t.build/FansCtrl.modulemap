@@ -1,4 +1,0 @@
-module FansCtrl {
-header "FansCtrl-Swift.h"
-export *
-}

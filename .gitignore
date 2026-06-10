@@ -1,5 +1,6 @@
 .build/
 .swiftpm/
 FansCtrl.app/
+fans ctrl.app/
 AppIcon.icns
 *.xcuserstate

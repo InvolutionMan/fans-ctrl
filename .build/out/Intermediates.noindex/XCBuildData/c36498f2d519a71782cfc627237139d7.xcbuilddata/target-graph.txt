@@ -1,6 +1,0 @@
-Target dependency graph (3 targets)
-Target 'AllExcludingTests' in project 'Aggregate'
-➜ Explicit dependency on target 'FansCtrl-product' in project 'FansCtrl'
-➜ Explicit dependency on target 'FansCtrl' in project 'FansCtrl'
-Target 'FansCtrl' in project 'FansCtrl' (no dependencies)
-Target 'FansCtrl-product' in project 'FansCtrl' (no dependencies)

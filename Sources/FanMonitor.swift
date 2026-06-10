@@ -3,26 +3,33 @@ import IOKit
 
 // MARK: - Models
 
-struct Fan: Identifiable {
+struct Fan: Identifiable, Equatable {
     let id: Int
     let name: String
     var rpm: Int
     var minRPM: Int
     var maxRPM: Int
-    var load: Double { maxRPM > minRPM ? Double(rpm - minRPM) / Double(maxRPM - minRPM) : 0 }
+    var targetRPM: Int       // F%dTg — SMC target RPM
+    var isManualMode: Bool   // whether this fan is in manual control
+    var load: Double { maxRPM > minRPM ? max(0, min(1, Double(rpm - minRPM) / Double(maxRPM - minRPM))) : 0 }
 }
 
-struct TempSensor: Identifiable {
+struct TempSensor: Identifiable, Equatable {
     let id: String
     let name: String
     var celsius: Double
+    
+    static func == (lhs: TempSensor, rhs: TempSensor) -> Bool {
+        lhs.id == rhs.id && lhs.celsius == rhs.celsius
+    }
 }
 
 // MARK: - Fan Monitor
 
 class FanMonitor: ObservableObject {
     @Published var fans: [Fan] = []
-    @Published var averageCPUTemperature: Double = 0
+    @Published var temperatures: [TempSensor] = []
+    @Published var averageCPUTemperature: Double? = nil
 
     private var timer: Timer?
 
@@ -33,66 +40,94 @@ class FanMonitor: ObservableObject {
 
     deinit { stopPolling() }
 
-    // MARK: - Temperatures
+    // MARK: - Read Temperatures
 
     private func readTemperatures() {
-        var temps: [Double] = []
+        var sensors: [TempSensor] = []
 
-        guard let conn = SMCConnection() else {
+        guard let connection = SMCConnection() else {
+            temperatures = [TempSensor(id: "TC0P", name: "CPU", celsius: 62)]
             averageCPUTemperature = 62
             return
         }
-        defer { conn.close() }
 
-        let keys = [
-            "Tp09","Tp0T","Tp0p","TP0p","TP1p","TP2p","TP3p",
-            "Te0S","Te0p","Te0P","TE0p","TE1p","TE2p","TE3p",
-            "TA0P","TA0p","TB0T","TB1T","TB2T",
-            "pCP0","pCP1","pCP2","pCP3","pG0C","pACC",
-            "TC0C","TC0P","TC0D","TC0E","TC0F","TC0H",
-            "TC1C","TC2C","TC3C","TC4C","TC5C","TC6C","TC7C","TC8C",
+        let cpuTemperatureKeys = [
+            "Te05", "Te0S", "Te09", "Te0H",
+            "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0V", "Tp0Y", "Tp0b", "Tp0e",
+            "TC0C", "TC0P", "TC0E", "TC0F", "TC0D", "TC0H",
+            "TC1C", "TC2C", "TC3C", "TC4C", "TC5C", "TC6C", "TC7C", "TC8C",
         ]
-        for k in keys {
-            if let t = conn.readFloat(k), t > 0, t < 130 { temps.append(t) }
+
+        for key in cpuTemperatureKeys {
+            if let temp = connection.readNumericValue(for: key), temp > 0, temp < 130 {
+                let name: String
+                switch key {
+                case let k where k.hasPrefix("TC"): name = "CPU Core \(k.dropFirst(2))"
+                case let k where k.hasPrefix("Tp"): name = "CPU Proximity"
+                case let k where k.hasPrefix("Te"): name = "CPU Efficiency"
+                default: name = key
+                }
+                sensors.append(TempSensor(id: key, name: name, celsius: temp))
+            }
         }
 
-        if !temps.isEmpty {
-            averageCPUTemperature = temps.reduce(0, +) / Double(temps.count)
-        } else {
-            averageCPUTemperature = 62  // M4 fallback
+        if !sensors.isEmpty {
+            let avgTemp = sensors.reduce(0.0) { $0 + $1.celsius } / Double(sensors.count)
+            sensors.insert(TempSensor(id: "CPU", name: "CPU", celsius: avgTemp), at: 0)
+            averageCPUTemperature = avgTemp
         }
+
+        if sensors.isEmpty {
+            sensors = [TempSensor(id: "TC0P", name: "CPU", celsius: 62)]
+            averageCPUTemperature = 62
+        }
+
+        temperatures = sensors
     }
 
-    // MARK: - Fans
+    // MARK: - Read Fans
 
     private func readFans() {
-        guard let conn = SMCConnection() else {
+        guard let connection = SMCConnection() else {
             fans = [
-                Fan(id: 0, name: "左侧风扇", rpm: 2150, minRPM: 1800, maxRPM: 6200),
-                Fan(id: 1, name: "右侧风扇", rpm: 1980, minRPM: 1800, maxRPM: 6200)
+                Fan(id: 0, name: "风扇 1", rpm: 2150, minRPM: 1800, maxRPM: 6200, targetRPM: 2150, isManualMode: false),
+                Fan(id: 1, name: "风扇 2", rpm: 1980, minRPM: 1800, maxRPM: 6200, targetRPM: 1980, isManualMode: false)
             ]
             return
         }
-        defer { conn.close() }
 
-        let fanCount = Int(conn.readFloat("FNum") ?? 1)
+        let fanCount = connection.readNumericValue(for: "FNum").map { max(0, Int($0.rounded(.down))) } ?? 2
+
+        // Detect which mode key works on this hardware (M5+ uses lowercase, M1-M4 uppercase)
+        let modeKeyTemplate: String = connection.readNumericValue(for: "F0md") != nil ? "F%dmd" : "F%dMd"
+
         var newFans: [Fan] = []
         for i in 0..<max(1, fanCount) {
-            let rpm = conn.readFloat("F\(i)Ac").map { Int($0) } ?? 0
-            let mn = conn.readFloat("F\(i)Mn").map { Int($0) } ?? 1800
-            let mx = conn.readFloat("F\(i)Mx").map { Int($0) } ?? 6200
-            newFans.append(Fan(id: i, name: i == 0 ? "左侧风扇" : "右侧风扇",
-                               rpm: rpm, minRPM: max(mn, 1800), maxRPM: max(mx, 2000)))
+            let rpm = connection.readNumericValue(for: "F\(i)Ac").map { Int($0.rounded()) } ?? 2000
+            let min = connection.readNumericValue(for: "F\(i)Mn").map { Int($0.rounded()) } ?? 1800
+            let max = connection.readNumericValue(for: "F\(i)Mx").map { Int($0.rounded()) } ?? 6200
+            let target = connection.readNumericValue(for: "F\(i)Tg").map { Int($0.rounded()) } ?? rpm
+            let modeKey = String(format: modeKeyTemplate, i)
+            let modeValue = connection.readNumericValue(for: modeKey).map { Int($0) } ?? 0
+            let isManual = modeValue == 1
+            newFans.append(Fan(id: i, name: i == 0 ? "风扇 1" : "风扇 2",
+                              rpm: rpm, minRPM: min, maxRPM: max,
+                              targetRPM: target, isManualMode: isManual))
         }
+
         if newFans.isEmpty {
-            newFans = [Fan(id: 0, name: "风扇", rpm: 0, minRPM: 0, maxRPM: 6200)]
+            newFans = [
+                Fan(id: 0, name: "风扇 1", rpm: 2150, minRPM: 1800, maxRPM: 6200, targetRPM: 2150, isManualMode: false),
+                Fan(id: 1, name: "风扇 2", rpm: 1980, minRPM: 1800, maxRPM: 6200, targetRPM: 1980, isManualMode: false)
+            ]
         }
+
         fans = newFans
     }
 
     // MARK: - Polling
 
-    func startPolling(interval: TimeInterval = 1.0) {
+    func startPolling(interval: TimeInterval = 3.0) {
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.poll()
         }
@@ -103,93 +138,119 @@ class FanMonitor: ObservableObject {
     private func poll() { readFans(); readTemperatures() }
 }
 
-// MARK: - SMC Connection (shared)
+// MARK: - SMC Connection
 
-class SMCConnection {
-    private let conn: io_connect_t
-    private static var sharedConn: SMCConnection?
+private class SMCConnection {
+    private let connection: io_connect_t
 
     init?() {
-        if let existing = Self.sharedConn, existing.conn != 0 { self.conn = existing.conn; return }
-        let m = IOServiceMatching("AppleSMC")
-        let s = IOServiceGetMatchingService(kIOMainPortDefault, m)
-        guard s != IO_OBJECT_NULL else { return nil }
-        defer { IOObjectRelease(s) }
-        var c: io_connect_t = 0
-        guard IOServiceOpen(s, mach_task_self_, 0, &c) == kIOReturnSuccess else { return nil }
-        self.conn = c
-        Self.sharedConn = self
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+        guard service != IO_OBJECT_NULL else { return nil }
+        defer { IOObjectRelease(service) }
+
+        var connection = io_connect_t()
+        let result = IOServiceOpen(service, mach_task_self_, 0, &connection)
+        guard result == kIOReturnSuccess else { return nil }
+
+        self.connection = connection
     }
 
-    func close() {} // shared, no-op
+    deinit { IOServiceClose(connection) }
 
-    deinit { if Self.sharedConn === nil { IOServiceClose(conn) } }
-
-    // MARK: - Read
-
-    func readFloat(_ key: String) -> Double? {
-        guard key.count == 4 else { return nil }
-        var i = SMCKD(), o = SMCKD()
-        i.k = smcKey32(key); i.d8 = 9; var isz=MemoryLayout<SMCKD>.stride, osz=MemoryLayout<SMCKD>.stride
-        guard IOConnectCallStructMethod(conn,2,&i,isz,&o,&osz)==kIOReturnSuccess, o.res==0 else { return nil }
-        let info = o.ki; i.ki=info; i.d8=5
-        isz=MemoryLayout<SMCKD>.stride; osz=MemoryLayout<SMCKD>.stride
-        guard IOConnectCallStructMethod(conn,2,&i,isz,&o,&osz)==kIOReturnSuccess else { return nil }
-        let raw = o.rawBytes(count: Int(info.sz))
-        return decodeSMCValue(type: info.tp, bytes: raw)
+    func readNumericValue(for key: String) -> Double? {
+        guard let value = readKey(key), value.result == 0 else { return nil }
+        return value.numericValue
     }
 
-    // MARK: - Write (needs root on Apple Silicon)
+    private func readKey(_ key: String) -> SMCValue? {
+        var input = SMCKeyData()
+        var output = SMCKeyData()
+        input.key = key.smcKeyCode
+        input.data8 = SMC_CMD_READ_KEY_INFO
 
-    func writeByte(_ key: String, _ value: UInt8) -> Bool {
-        guard key.count == 4 else { return false }
-        var i = SMCKD(), o = SMCKD()
-        i.k = smcKey32(key); i.d8 = 9; var isz=MemoryLayout<SMCKD>.stride, osz=MemoryLayout<SMCKD>.stride
-        guard IOConnectCallStructMethod(conn,2,&i,isz,&o,&osz)==kIOReturnSuccess, o.res==0 else { return false }
-        let info = o.ki; i.ki=info; i.d8=6; i.b.b0=value
-        isz=MemoryLayout<SMCKD>.stride; osz=MemoryLayout<SMCKD>.stride
-        return IOConnectCallStructMethod(conn,2,&i,isz,&o,&osz)==kIOReturnSuccess && o.res==0
+        guard call(input: &input, output: &output) == kIOReturnSuccess, output.result == 0 else { return nil }
+
+        let keyInfo = output.keyInfo
+        input.keyInfo = keyInfo
+        input.data8 = SMC_CMD_READ_BYTES
+
+        guard call(input: &input, output: &output) == kIOReturnSuccess else { return nil }
+
+        return SMCValue(keyInfo: keyInfo, result: output.result, bytes: output.byteArray(size: keyInfo.dataSize))
     }
 
-    func writeUInt16(_ key: String, _ value: UInt16) -> Bool {
-        guard key.count == 4 else { return false }
-        var i = SMCKD(), o = SMCKD()
-        i.k = smcKey32(key); i.d8 = 9; var isz=MemoryLayout<SMCKD>.stride, osz=MemoryLayout<SMCKD>.stride
-        guard IOConnectCallStructMethod(conn,2,&i,isz,&o,&osz)==kIOReturnSuccess, o.res==0 else { return false }
-        let info = o.ki; i.ki=info; i.d8=6; i.b.b0=UInt8(value>>8); i.b.b1=UInt8(value&0xFF)
-        isz=MemoryLayout<SMCKD>.stride; osz=MemoryLayout<SMCKD>.stride
-        return IOConnectCallStructMethod(conn,2,&i,isz,&o,&osz)==kIOReturnSuccess && o.res==0
+    private func call(input: inout SMCKeyData, output: inout SMCKeyData) -> kern_return_t {
+        let inputSize = MemoryLayout<SMCKeyData>.stride
+        var outputSize = MemoryLayout<SMCKeyData>.stride
+        return IOConnectCallStructMethod(connection, KERNEL_INDEX_SMC, &input, inputSize, &output, &outputSize)
     }
 }
 
-// MARK: - SMC Structs & Decode
+// MARK: - SMC Constants
 
-private struct SMCV { var m:UInt8=0,n:UInt8=0,b:UInt8=0,r:UInt8=0,rel:UInt16=0 }
-private struct SMCP { var v:UInt16=0,len:UInt16=0,cp:UInt32=0,gp:UInt32=0,mp:UInt32=0 }
-private struct SMCK { var sz:UInt32=0,tp:UInt32=0,at:UInt8=0 }
-private struct SMCB { var b0:UInt8=0,b1:UInt8=0,b2:UInt8=0,b3:UInt8=0,b4:UInt8=0,b5:UInt8=0,b6:UInt8=0,b7:UInt8=0,b8:UInt8=0,b9:UInt8=0,b10:UInt8=0,b11:UInt8=0,b12:UInt8=0,b13:UInt8=0,b14:UInt8=0,b15:UInt8=0,b16:UInt8=0,b17:UInt8=0,b18:UInt8=0,b19:UInt8=0,b20:UInt8=0,b21:UInt8=0,b22:UInt8=0,b23:UInt8=0,b24:UInt8=0,b25:UInt8=0,b26:UInt8=0,b27:UInt8=0,b28:UInt8=0,b29:UInt8=0,b30:UInt8=0,b31:UInt8=0 }
-private struct SMCKD { var k:UInt32=0,v=SMCV(),p=SMCP(),ki=SMCK(),pad:UInt16=0,res:UInt8=0,st:UInt8=0,d8:UInt8=0,d32:UInt32=0,b=SMCB()
-    func rawBytes(count: Int) -> [UInt8] {
-        let all = [b.b0,b.b1,b.b2,b.b3,b.b4,b.b5,b.b6,b.b7,b.b8,b.b9,b.b10,b.b11,b.b12,b.b13,b.b14,b.b15,b.b16,b.b17,b.b18,b.b19,b.b20,b.b21,b.b22,b.b23,b.b24,b.b25,b.b26,b.b27,b.b28,b.b29,b.b30,b.b31]
-        return Array(all.prefix(count))
+private let KERNEL_INDEX_SMC: UInt32 = 2
+private let SMC_CMD_READ_BYTES: UInt8 = 5
+private let SMC_CMD_READ_KEY_INFO: UInt8 = 9
+
+// MARK: - SMC Value
+
+private struct SMCValue {
+    let keyInfo: SMCKeyInfoData
+    let result: UInt8
+    let bytes: [UInt8]
+
+    var numericValue: Double? {
+        switch keyInfo.dataType.stringValue {
+        case "ui8 ": return bytes.first.map(Double.init)
+        case "ui16": guard bytes.count >= 2 else { return nil }; return Double(UInt16(bytes[0]) << 8 | UInt16(bytes[1]))
+        case "sp78": guard bytes.count >= 2 else { return nil }; return Double(Int16(bitPattern: UInt16(bytes[0]) << 8 | UInt16(bytes[1]))) / 256
+        case "fpe2": guard bytes.count >= 2 else { return nil }; return Double(UInt16(bytes[0]) << 8 | UInt16(bytes[1])) / 4
+        case "flt ": guard bytes.count >= 4 else { return nil }; return Double(bytes.withUnsafeBytes { $0.loadUnaligned(as: Float.self) })
+        default: return nil
+        }
     }
 }
 
-private func smcKey32(_ s: String) -> UInt32 { s.utf8.prefix(4).reduce(0){($0<<8)+UInt32($1)} }
+// MARK: - SMC Data Structures
 
-private func decodeSMCValue(type: UInt32, bytes: [UInt8]) -> Double? {
-    switch type {
-    case 0x73703738: // sp78
-        if bytes.count>=2 { return Double(Int16(bitPattern: UInt16(bytes[0])<<8|UInt16(bytes[1])))/256.0 }
-    case 0x66706532: // fpe2
-        if bytes.count>=2 { return Double(UInt16(bytes[0])<<8|UInt16(bytes[1]))/4.0 }
-    case 0x75693136: // ui16
-        if bytes.count>=2 { return Double(UInt16(bytes[0])<<8|UInt16(bytes[1])) }
-    case 0x75693820: // ui8
-        return Double(bytes[0])
-    case 0x666c7420: // flt
-        if bytes.count>=4 { return Double(Float(bitPattern:UInt32(bytes[0])<<24|UInt32(bytes[1])<<16|UInt32(bytes[2])<<8|UInt32(bytes[3]))) }
-    default: break
+private struct SMCVersion { var major: UInt8 = 0; var minor: UInt8 = 0; var build: UInt8 = 0; var reserved: UInt8 = 0; var release: UInt16 = 0 }
+private struct SMCPLimitData { var version: UInt16 = 0; var length: UInt16 = 0; var cpuPLimit: UInt32 = 0; var gpuPLimit: UInt32 = 0; var memPLimit: UInt32 = 0 }
+private struct SMCKeyInfoData { var dataSize: UInt32 = 0; var dataType: UInt32 = 0; var dataAttributes: UInt8 = 0 }
+
+private struct SMCKeyData {
+    var key: UInt32 = 0
+    var vers = SMCVersion()
+    var pLimitData = SMCPLimitData()
+    var keyInfo = SMCKeyInfoData()
+    var padding: UInt16 = 0
+    var result: UInt8 = 0
+    var status: UInt8 = 0
+    var data8: UInt8 = 0
+    var data32: UInt32 = 0
+    var bytes = SMCBytes()
+
+    func byteArray(size: UInt32) -> [UInt8] { Array(bytes.array.prefix(Int(size))) }
+}
+
+private struct SMCBytes {
+    var byte0: UInt8 = 0; var byte1: UInt8 = 0; var byte2: UInt8 = 0; var byte3: UInt8 = 0
+    var byte4: UInt8 = 0; var byte5: UInt8 = 0; var byte6: UInt8 = 0; var byte7: UInt8 = 0
+    var byte8: UInt8 = 0; var byte9: UInt8 = 0; var byte10: UInt8 = 0; var byte11: UInt8 = 0
+    var byte12: UInt8 = 0; var byte13: UInt8 = 0; var byte14: UInt8 = 0; var byte15: UInt8 = 0
+    var byte16: UInt8 = 0; var byte17: UInt8 = 0; var byte18: UInt8 = 0; var byte19: UInt8 = 0
+    var byte20: UInt8 = 0; var byte21: UInt8 = 0; var byte22: UInt8 = 0; var byte23: UInt8 = 0
+    var byte24: UInt8 = 0; var byte25: UInt8 = 0; var byte26: UInt8 = 0; var byte27: UInt8 = 0
+    var byte28: UInt8 = 0; var byte29: UInt8 = 0; var byte30: UInt8 = 0; var byte31: UInt8 = 0
+    var array: [UInt8] { [byte0,byte1,byte2,byte3,byte4,byte5,byte6,byte7,byte8,byte9,byte10,byte11,byte12,byte13,byte14,byte15,byte16,byte17,byte18,byte19,byte20,byte21,byte22,byte23,byte24,byte25,byte26,byte27,byte28,byte29,byte30,byte31] }
+}
+
+private extension String {
+    var smcKeyCode: UInt32 { unicodeScalars.prefix(4).reduce(UInt32(0)) { ($0 << 8) + UInt32($1.value) } }
+}
+
+private extension UInt32 {
+    var stringValue: String {
+        let s = [UnicodeScalar((self>>24)&0xff),UnicodeScalar((self>>16)&0xff),UnicodeScalar((self>>8)&0xff),UnicodeScalar(self&0xff)]
+        return String(String.UnicodeScalarView(s.compactMap{$0}))
     }
-    return nil
 }

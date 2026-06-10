@@ -1,33 +1,19 @@
 import SwiftUI
-import AppKit
-
-// MARK: - CLI Mode
-
-private func handleCLI() -> Bool {
-    let args = CommandLine.arguments
-    guard args.count >= 4, args[1] == "smc-write" else { return false }
-
-    let key = args[2]
-    let val = UInt8(args[3]) ?? 0
-
-    guard let conn = SMCConnection() else {
-        print("SMC unavailable"); exit(1)
-    }
-
-    let ok = conn.writeByte(key, val)
-    print(ok ? "OK" : "ERR")
-    exit(ok ? 0 : 1)
-}
-
-// MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if geteuid() != 0 {
+            escalateAndRestart()
+            return
+        }
+
+        // root 实例：激活窗口
         DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
             for window in NSApp.windows where !window.className.contains("StatusBar") {
                 window.delegate = self
                 window.isReleasedWhenClosed = false
+                window.makeKeyAndOrderFront(nil)
             }
         }
     }
@@ -36,9 +22,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sender.orderOut(nil)
         return false
     }
-}
 
-// MARK: - App
+    /// 通过终端 sudo 提权，保留用户 UI 会话（可访问菜单栏）
+    private func escalateAndRestart() {
+        guard let exec = Bundle.main.executablePath else { return }
+
+        let source = """
+        tell application "Terminal"
+            activate
+            do script "sudo \\"\(exec)\\""
+        end tell
+        """
+
+        if let appleScript = NSAppleScript(source: source) {
+            var error: NSDictionary?
+            appleScript.executeAndReturnError(&error)
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            exit(0)
+        }
+    }
+}
 
 @main
 struct FansCtrlApp: App {
@@ -48,8 +53,6 @@ struct FansCtrlApp: App {
     @StateObject private var menuBarController: MenuBarController
 
     init() {
-        _ = handleCLI()  // exits process if CLI mode
-
         let monitor = FanMonitor()
         _monitor = StateObject(wrappedValue: monitor)
         _menuBarController = StateObject(wrappedValue: MenuBarController(monitor: monitor))
@@ -60,13 +63,10 @@ struct FansCtrlApp: App {
             ContentView()
                 .environmentObject(monitor)
                 .environmentObject(controller)
+                .environmentObject(menuBarController)
                 .frame(minWidth: 680, minHeight: 520)
-                .onAppear {
-                    monitor.startPolling(interval: 1.0)
-                }
-                .onDisappear {
-                    monitor.stopPolling()
-                }
+                .onAppear { monitor.startPolling() }
+                .onDisappear { monitor.stopPolling() }
         }
         .windowStyle(.titleBar)
         .defaultSize(width: 720, height: 560)

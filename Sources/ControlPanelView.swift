@@ -1,52 +1,39 @@
 import SwiftUI
-import AppKit
-
-// MARK: - Privileged SMC helper
-
-private func requestAdminAndWrite() {
-    let bin = "/Users/yonderdiary/Desktop/fans ctrl/.build/debug/FansCtrl"
-    let scriptStr = "do shell script \"'\(bin)' smc-write F0Md 1\" with administrator privileges"
-
-    guard let s = NSAppleScript(source: scriptStr) else { return }
-    var err: NSDictionary?
-    s.executeAndReturnError(&err)
-    if let e = err {
-        print("提权失败: \(e)")
-    } else {
-        print("提权成功")
-        // Refresh controller state
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            // Notification to retry
-            NotificationCenter.default.post(name: NSNotification.Name("PrivilegesGranted"), object: nil)
-        }
-    }
-}
-
-// MARK: - View
 
 struct ControlPanelView: View {
     @EnvironmentObject var controller: FanController
+    @EnvironmentObject var monitor: FanMonitor
 
     var body: some View {
-        HStack(spacing: 14) {
-            // 左侧：模式 + 滑块
+        HStack(alignment: .top, spacing: 16) {
             VStack(alignment: .leading, spacing: 12) {
-                Text("风扇控制")
-                    .font(.system(size: 13, weight: .semibold))
+                HStack {
+                    Text("风扇控制")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    if let error = controller.lastError {
+                        Text(error)
+                            .font(.system(size: 10))
+                            .foregroundColor(.red)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(Color.red.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }
+                }
 
-                // 自动 / 手动 切换
+                // Mode selector
                 HStack(spacing: 2) {
                     ForEach(FanMode.allCases) { mode in
-                        Button {
-                            controller.mode = mode
-                            controller.applyFanSettings()
-                        } label: {
+                        Button(action: {
+                            controller.setMode(mode)
+                        }) {
                             Text(mode.rawValue)
                                 .font(.system(size: 11, weight: .medium))
                                 .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
-                                .background(controller.mode == mode
-                                    ? Color.gray.opacity(0.3) : Color.clear)
+                                .padding(.vertical, 7)
+                                .padding(.horizontal, 10)
+                                .background(controller.mode == mode ? Color.gray.opacity(0.25) : Color.clear)
                                 .foregroundColor(controller.mode == mode ? .primary : .secondary)
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
@@ -58,89 +45,193 @@ struct ControlPanelView: View {
                 .background(Color(NSColor.windowBackgroundColor))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
 
-                // 手动模式下显示目标转速滑块
+                // Manual mode — per-fan controls
                 if controller.mode == .manual {
-                    VStack(spacing: 4) {
-                        HStack {
-                            Text("目标转速")
-                                .font(.system(size: 11))
-                                .foregroundColor(.secondary)
-                            Spacer()
-                            Text("\(Int(controller.targetRPM)) RPM")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .monospacedDigit()
-                                .foregroundColor(.primary)
+                    VStack(spacing: 10) {
+                        ForEach(monitor.fans) { fan in
+                            PerFanControlView(fan: fan)
                         }
-                        Slider(value: $controller.targetRPM,
-                               in: 1000...6500, step: 100)
-                            .controlSize(.small)
-                            .onChange(of: controller.targetRPM) { _, _ in
-                                controller.applyFanSettings()
-                            }
                     }
                     .transition(.opacity)
                 }
 
-                // Status
-                if !controller.statusMessage.isEmpty {
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(controller.canWrite ? Color.green : Color.orange)
-                            .frame(width: 6, height: 6)
-                        Text(controller.statusMessage)
-                            .font(.system(size: 10))
-                            .foregroundColor(controller.canWrite ? .green : .orange)
-                        Spacer()
-                        if !controller.canWrite {
-                            Button("解锁风扇控制") {
-                                requestAdminAndWrite()
+                // Sensor mode
+                if controller.mode == .sensor {
+                    VStack(spacing: 10) {
+                        VStack(spacing: 10) {
+                            SliderRow(label: "最低转速", value: $controller.sliderMin, range: 1800...5800, unit: "RPM")
+                            SliderRow(label: "最高转速", value: $controller.sliderMax, range: 2000...6200, unit: "RPM")
+                        }
+
+                        Divider()
+
+                        Text("温度联动设置")
+                            .font(.system(size: 12, weight: .semibold))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        HStack {
+                            Text("监控传感器")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Picker("", selection: $controller.selectedSensorID) {
+                                ForEach(controller.availableSensors) { sensor in
+                                    Text(sensor.name).tag(sensor.id)
+                                }
                             }
-                            .font(.system(size: 10))
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
+                            .pickerStyle(.menu)
+                            .frame(width: 150)
+                        }
+
+                        VStack(spacing: 4) {
+                            HStack {
+                                Text("目标温度")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text("\(Int(controller.targetTemperature))°C")
+                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                    .monospacedDigit()
+                                    .foregroundColor(.primary)
+                            }
+                            Slider(value: $controller.targetTemperature, in: 50...95, step: 1)
+                                .controlSize(.small)
+                        }
+
+                        VStack(spacing: 4) {
+                            HStack {
+                                Text("温滞范围")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text("±\(Int(controller.tempHysteresis))°C")
+                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                    .monospacedDigit()
+                                    .foregroundColor(.primary)
+                            }
+                            Slider(value: $controller.tempHysteresis, in: 1...10, step: 1)
+                                .controlSize(.small)
+                        }
+
+                        if let currentTemp = controller.availableSensors.first(where: { $0.id == controller.selectedSensorID })?.celsius {
+                            HStack {
+                                Text("当前温度")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text("\(Int(currentTemp))°C")
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(currentTemp > controller.targetTemperature ? .orange : .green)
+
+                                Text("→")
+                                    .foregroundColor(.secondary)
+
+                                Text("\(controller.calculateFanSpeed(currentTemperature: currentTemp)) RPM")
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.accentColor)
+                            }
                         }
                     }
-                    .padding(.vertical, 4)
+                    .transition(.opacity)
                 }
 
-                // Toggles
-                VStack(spacing: 0) {
-                    ToggleRow(label: "菜单栏图标", isOn: $controller.menuBarIcon)
-                }
             }
             .padding(16)
             .background(Color(NSColor.controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.gray.opacity(0.2), lineWidth: 0.5)
-            )
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.2), lineWidth: 0.5))
 
-            // 右侧：预设方案
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
                 Text("预设方案")
                     .font(.system(size: 13, weight: .semibold))
 
-                VStack(spacing: 6) {
-                    PresetButton(title: "均衡",   desc: "自动调节，日常使用",       preset: .balanced)
-                    PresetButton(title: "安静",   desc: "2000 RPM，降噪优先",       preset: .quiet)
-                    PresetButton(title: "中速",   desc: "3500 RPM，均衡散热",       preset: .medium)
-                    PresetButton(title: "性能",   desc: "4500 RPM，散热优先",       preset: .performance)
-                    PresetButton(title: "全速",   desc: "6000 RPM，极限散热",       preset: .fullSpeed)
+                VStack(spacing: 5) {
+                    PresetButton(title: "均衡", desc: "自动调节，日常使用", preset: .balanced)
+                    PresetButton(title: "安静", desc: "低转速，降噪优先", preset: .quiet)
+                    PresetButton(title: "性能", desc: "高转速，散热优先", preset: .performance)
+                    PresetButton(title: "全速", desc: "最大转速，极限散热", preset: .fullSpeed)
                 }
             }
-            .padding(16)
+            .padding(14)
+            .frame(width: 200)
             .background(Color(NSColor.controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.gray.opacity(0.2), lineWidth: 0.5)
-            )
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.15), lineWidth: 0.5))
         }
     }
 }
 
-// MARK: - Toggle Row
+// MARK: - Per-Fan Control
+
+struct PerFanControlView: View {
+    let fan: Fan
+    @EnvironmentObject var controller: FanController
+    @State private var localRPM: Double = 3000
+    @State private var isSyncing = false
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack {
+                Text(fan.name)
+                    .font(.system(size: 11, weight: .semibold))
+                Spacer()
+                Text("\(Int(localRPM)) RPM")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundColor(.accentColor)
+            }
+
+            Slider(value: $localRPM, in: Double(fan.minRPM)...Double(fan.maxRPM), step: 50)
+                .controlSize(.small)
+                .onChange(of: localRPM) {
+                    guard !isSyncing else { return }
+                    controller.setFanRPM(localRPM, fanIndex: fan.id)
+                }
+        }
+        .padding(10)
+        .background(Color(NSColor.windowBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .onAppear {
+            syncFromController()
+        }
+        .onChange(of: controller.fanTargetRPMs[fan.id]) {
+            syncFromController()
+        }
+    }
+
+    private func syncFromController() {
+        let target = controller.fanTargetRPMs[fan.id] ?? Double(fan.targetRPM > 0 ? fan.targetRPM : 3000)
+        let clamped = max(Double(fan.minRPM), min(Double(fan.maxRPM), target))
+        guard localRPM != clamped else { return }
+        isSyncing = true
+        localRPM = clamped
+        isSyncing = false
+    }
+}
+
+// MARK: - Shared Components
+
+struct SliderRow: View {
+    let label: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let unit: String
+
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text(label).font(.system(size: 11)).foregroundColor(.secondary)
+                Spacer()
+                Text("\(Int(value)) \(unit)")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundColor(.primary)
+            }
+            Slider(value: $value, in: range, step: 100)
+                .controlSize(.small)
+        }
+    }
+}
 
 struct ToggleRow: View {
     let label: String
@@ -148,19 +239,14 @@ struct ToggleRow: View {
 
     var body: some View {
         HStack {
-            Text(label)
-                .font(.system(size: 12))
+            Text(label).font(.system(size: 12))
             Spacer()
-            Toggle("", isOn: $isOn)
-                .toggleStyle(.switch)
-                .controlSize(.small)
+            Toggle("", isOn: $isOn).toggleStyle(.switch).controlSize(.small)
         }
         .padding(.vertical, 8)
         .overlay(Divider(), alignment: .bottom)
     }
 }
-
-// MARK: - Preset Button
 
 struct PresetButton: View {
     let title: String
@@ -171,26 +257,18 @@ struct PresetButton: View {
     var isActive: Bool { controller.activePreset == preset }
 
     var body: some View {
-        Button { controller.applyPreset(preset) } label: {
+        Button(action: { controller.applyPreset(preset) }) {
             VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.system(size: 11, weight: .semibold))
-                Text(desc)
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
+                Text(title).font(.system(size: 11, weight: .semibold))
+                Text(desc).font(.system(size: 9)).foregroundColor(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(8)
-            .background(isActive
-                ? Color.accentColor.opacity(0.12)
-                : Color(NSColor.windowBackgroundColor))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(isActive ? Color.accentColor.opacity(0.1) : Color(NSColor.windowBackgroundColor))
             .foregroundColor(isActive ? .accentColor : .primary)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(isActive ? Color.accentColor.opacity(0.4) : Color.gray.opacity(0.15),
-                            lineWidth: 0.5)
-            )
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .overlay(RoundedRectangle(cornerRadius: 5).stroke(isActive ? Color.accentColor.opacity(0.3) : Color.gray.opacity(0.12), lineWidth: 0.5))
         }
         .buttonStyle(.plain)
     }
